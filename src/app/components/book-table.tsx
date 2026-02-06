@@ -38,7 +38,7 @@ export function BookTable({ apiEndpoint, jenjang }: BookTableProps) {
   // Confirmation dialog state
   const [isConfirmDialogOpen, setIsConfirmDialogOpen] = useState(false);
   const [pendingStatusChange, setPendingStatusChange] = useState<{
-    bookIndex: number;
+    book: DynamicRecord;
     newStatus: string;
   } | null>(null);
   
@@ -411,11 +411,11 @@ export function BookTable({ apiEndpoint, jenjang }: BookTableProps) {
   };
 
   // Handle status ketersediaan change
-  const handleStatusChange = (bookIndex: number, newStatus: string) => {
+  const handleStatusChange = (book: DynamicRecord, newStatus: string) => {
     if (!newStatus) return; // Jangan proses jika status kosong
     
     // Set pending change and open confirmation dialog
-    setPendingStatusChange({ bookIndex, newStatus });
+    setPendingStatusChange({ book, newStatus });
     setIsConfirmDialogOpen(true);
   };
 
@@ -423,92 +423,120 @@ export function BookTable({ apiEndpoint, jenjang }: BookTableProps) {
   const confirmStatusChange = async () => {
     if (!pendingStatusChange) return;
     
-    const { bookIndex, newStatus } = pendingStatusChange;
+    const { book, newStatus } = pendingStatusChange;
+    const bookIndex = books.findIndex(
+      (b) =>
+        (b.NO && b.NO === book.NO) ||
+        (b._ID && b._ID === book._ID) ||
+        (b.ID && b.ID === book.ID) ||
+        b === book
+    );
+    
+    if (bookIndex === -1) {
+      toast.error('Buku tidak ditemukan dalam data.');
+      setIsConfirmDialogOpen(false);
+      setPendingStatusChange(null);
+      return;
+    }
+    
+    const oldStatus = book['KETERSEDIAAN'];
     
     // Update lokal langsung untuk responsiveness
     const updatedBooks = [...books];
-    const oldStatus = updatedBooks[bookIndex]['KETERSEDIAAN'];
-    updatedBooks[bookIndex]['KETERSEDIAAN'] = newStatus;
+    updatedBooks[bookIndex] = { ...updatedBooks[bookIndex], KETERSEDIAAN: newStatus };
     setBooks(updatedBooks);
 
     // Close dialog
     setIsConfirmDialogOpen(false);
     setPendingStatusChange(null);
 
-    // Show loading toast
     const toastId = toast.loading('Menyimpan...');
 
     try {
-      // Find column index for KETERSEDIAAN
       const ketersediaanColIndex = allColumns.indexOf('KETERSEDIAAN');
-      
       if (ketersediaanColIndex === -1) {
         throw new Error('Kolom KETERSEDIAAN tidak ditemukan');
       }
 
-      // rowIndex di spreadsheet (tambah 1 karena ada header, tambah bookIndex untuk data row)
-      const originalRowIndex = books.indexOf(updatedBooks[bookIndex]);
-      const spreadsheetRowIndex = originalRowIndex + 1; // +1 karena row 0 adalah header
+      // Apps Script: sheetRow = rowIndex + 1, sheetCol = colIndex + 1
+      // rowIndex 1 = baris data pertama (sheet row 2). Jadi rowIndex = bookIndex + 1
+      const rowIndex = bookIndex + 1;
 
-      // Build JSONP URL untuk bypass CORS
-      const callbackName = `jsonpCallback${Date.now()}`;
-      const updateUrl = `${apiEndpoint}?action=updateCell&rowIndex=${spreadsheetRowIndex}&colIndex=${ketersediaanColIndex}&value=${encodeURIComponent(newStatus)}&callback=${callbackName}`;
+      const payload = {
+        action: 'updateCell',
+        rowIndex,
+        colIndex: ketersediaanColIndex,
+        value: newStatus,
+      };
 
-      // Use JSONP to bypass CORS
-      await new Promise((resolve, reject) => {
-        const script = document.createElement('script');
-        
-        // Set timeout (5 detik untuk lebih cepat)
-        const timeout = setTimeout(() => {
-          cleanup();
-          reject(new Error('Request timeout'));
-        }, 5000);
+      // Coba fetch POST dulu; jika gagal (CORS/dll) fallback ke JSONP GET
+      try {
+        const res = await fetch(apiEndpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok && (data.success === true || data?.result === 'ok')) {
+          toast.success('Tersimpan', { id: toastId, duration: 2000 });
+          return;
+        }
+        if (res.ok && data.success !== false && !data.error) {
+          toast.success('Tersimpan', { id: toastId, duration: 2000 });
+          return;
+        }
+        throw new Error(data.message || data.error || `HTTP ${res.status}`);
+      } catch {
+        // Fallback: JSONP GET (untuk Apps Script yang hanya support GET)
+        await new Promise<void>((resolve, reject) => {
+          const callbackName = `jsonpCallback${Date.now()}`;
+          const params = new URLSearchParams({
+            action: 'updateCell',
+            rowIndex: String(rowIndex),
+            colIndex: String(ketersediaanColIndex),
+            value: newStatus,
+            callback: callbackName,
+          });
+          const url = `${apiEndpoint}?${params.toString()}`;
+          const script = document.createElement('script');
+          const timeout = setTimeout(() => {
+            cleanup();
+            reject(new Error('Request timeout'));
+          }, 8000);
 
-        // Define callback
-        (window as any)[callbackName] = (response: any) => {
-          clearTimeout(timeout);
-          cleanup();
-          if (response.success) {
-            resolve(response);
-          } else {
-            reject(new Error(response.message || 'Update gagal'));
-          }
-        };
+          (window as any)[callbackName] = (response: any) => {
+            clearTimeout(timeout);
+            cleanup();
+            if (response?.success === true) {
+              resolve();
+            } else {
+              reject(new Error(response?.message || 'Update gagal'));
+            }
+          };
 
-        // Cleanup function
-        const cleanup = () => {
-          delete (window as any)[callbackName];
-          if (script.parentNode) {
-            script.parentNode.removeChild(script);
-          }
-        };
+          const cleanup = () => {
+            delete (window as any)[callbackName];
+            script.parentNode?.removeChild(script);
+          };
 
-        // Handle script error
-        script.onerror = () => {
-          clearTimeout(timeout);
-          cleanup();
-          reject(new Error('Failed to load script'));
-        };
-
-        // Set script src and append to document
-        script.src = updateUrl;
-        document.head.appendChild(script);
-      });
-
-      // Success - toast singkat
-      toast.success(`Tersimpan`, { id: toastId, duration: 2000 });
-      
+          script.onerror = () => {
+            clearTimeout(timeout);
+            cleanup();
+            reject(new Error('Request gagal'));
+          };
+          script.src = url;
+          document.head.appendChild(script);
+        });
+        toast.success('Tersimpan', { id: toastId, duration: 2000 });
+      }
     } catch (error) {
       console.error('Error updating to spreadsheet:', error);
-      
-      // Rollback ke status lama
       const rolledBackBooks = [...books];
-      rolledBackBooks[bookIndex]['KETERSEDIAAN'] = oldStatus;
+      rolledBackBooks[bookIndex] = { ...rolledBackBooks[bookIndex], KETERSEDIAAN: oldStatus };
       setBooks(rolledBackBooks);
-      
       toast.error(
-        `Gagal menyimpan. Dikembalikan ke status "${oldStatus}".`,
-        { id: toastId, duration: 3000 }
+        `Gagal menyimpan: ${error instanceof Error ? error.message : 'Unknown error'}. Dikembalikan ke "${oldStatus}".`,
+        { id: toastId, duration: 4000 }
       );
     }
   };
@@ -713,7 +741,7 @@ export function BookTable({ apiEndpoint, jenjang }: BookTableProps) {
                         {column === 'KETERSEDIAAN' ? (
                           <select
                             value={book[column] || ''}
-                            onChange={(e) => handleStatusChange(rowIndex, e.target.value)}
+                            onChange={(e) => handleStatusChange(book, e.target.value)}
                             className="w-full min-w-[160px] px-3 py-1.5 text-sm border border-slate-200 rounded-md focus:outline-none focus:ring-2 focus:ring-slate-900/20 focus:border-slate-400 bg-white hover:border-slate-300 transition-colors"
                           >
                             <option value="">Pilih Status</option>
